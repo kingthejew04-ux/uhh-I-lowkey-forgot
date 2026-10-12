@@ -121,7 +121,7 @@ public class HighlighterClient implements ClientModInitializer {
 	}
 
 	public static final class Config {
-		public static final int[] RANGES = {16, 32, 48, 64, 96};
+		public static final int[] RANGES = {16, 32, 48, 64, 96, 200, 300, 400};
 		public static int range = 48;
 
 		private Config() { }
