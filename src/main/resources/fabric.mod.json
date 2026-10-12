@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "blockhighlighter",
+  "version": "${version}",
+  "name": "Block Highlighter",
+  "description": "Through-wall highlights for chests, ender chests, respawn anchors and more, with an in-game menu.",
+  "authors": [],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["com.blockhighlighter.HighlighterClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.3",
+    "minecraft": ">=26.2",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}
