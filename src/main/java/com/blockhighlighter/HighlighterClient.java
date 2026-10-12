@@ -33,6 +33,11 @@ import org.joml.Vector4f;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Minecraft;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.monster.Enemy;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.KeyEvent;
@@ -104,35 +109,54 @@ public class HighlighterClient implements ClientModInitializer {
 		HighlightRenderer.register();
 	}
 
-	/** One toggleable highlight. Add your own by adding a line here. */
+	/** One toggleable highlight (a block type or an entity type). Add your own by adding a line here. */
 	public enum Feature {
-		CHEST("Chests", 0x70FFA000, true, s -> s.is(Blocks.CHEST) || s.is(Blocks.TRAPPED_CHEST)),
-		ENDER_CHEST("Ender Chests", 0x70B020FF, true, s -> s.is(Blocks.ENDER_CHEST)),
-		RESPAWN_ANCHOR("Respawn Anchors", 0x70FF3030, true, s -> s.is(Blocks.RESPAWN_ANCHOR)),
-		SPAWNER("Spawners", 0x7030C0FF, false, s -> s.is(Blocks.SPAWNER) || s.is(Blocks.TRIAL_SPAWNER)),
-		SHULKER("Shulker Boxes", 0x70FF70D0, false, s -> s.getBlock() instanceof ShulkerBoxBlock),
-		ANCIENT_DEBRIS("Ancient Debris", 0x70A06A40, false, s -> s.is(Blocks.ANCIENT_DEBRIS)),
-		DIAMOND_ORE("Diamond Ore", 0x7040FFFF, false, s -> s.is(Blocks.DIAMOND_ORE) || s.is(Blocks.DEEPSLATE_DIAMOND_ORE));
+		// ---- Blocks ----
+		CHEST("Chests", 0x70FFA000, true, s -> s.is(Blocks.CHEST) || s.is(Blocks.TRAPPED_CHEST), null),
+		ENDER_CHEST("Ender Chests", 0x70B020FF, true, s -> s.is(Blocks.ENDER_CHEST), null),
+		RESPAWN_ANCHOR("Respawn Anchors", 0x70FF3030, true, s -> s.is(Blocks.RESPAWN_ANCHOR), null),
+		SPAWNER("Spawners", 0x7030C0FF, false, s -> s.is(Blocks.SPAWNER) || s.is(Blocks.TRIAL_SPAWNER), null),
+		SHULKER("Shulker Boxes", 0x70FF70D0, false, s -> s.getBlock() instanceof ShulkerBoxBlock, null),
+		ANCIENT_DEBRIS("Ancient Debris", 0x70A06A40, false, s -> s.is(Blocks.ANCIENT_DEBRIS), null),
+		DIAMOND_ORE("Diamond Ore", 0x7040FFFF, false, s -> s.is(Blocks.DIAMOND_ORE) || s.is(Blocks.DEEPSLATE_DIAMOND_ORE), null),
+		// ---- Entities ----
+		PLAYERS("Players", 0x8055FF55, true, null, e -> e instanceof Player),
+		HOSTILE_MOBS("Hostile Mobs", 0x80FF5555, false, null, e -> e instanceof Enemy),
+		ITEMS("Dropped Items", 0x80FFFF55, false, null, e -> e instanceof ItemEntity);
 
 		public final String label;
 		public final int defaultArgb;
 		public final boolean defaultEnabled;
-		private final Predicate<BlockState> matcher;
+		private final Predicate<BlockState> blockMatcher;
+		private final Predicate<Entity> entityMatcher;
 
 		public boolean enabled;
 		public int argb;
 
-		Feature(String label, int defaultArgb, boolean defaultEnabled, Predicate<BlockState> matcher) {
+		Feature(String label, int defaultArgb, boolean defaultEnabled, Predicate<BlockState> blockMatcher, Predicate<Entity> entityMatcher) {
 			this.label = label;
 			this.defaultArgb = defaultArgb;
 			this.defaultEnabled = defaultEnabled;
-			this.matcher = matcher;
+			this.blockMatcher = blockMatcher;
+			this.entityMatcher = entityMatcher;
 			this.enabled = defaultEnabled;
 			this.argb = defaultArgb;
 		}
 
+		public boolean isBlock() {
+			return this.blockMatcher != null;
+		}
+
+		public boolean isEntity() {
+			return this.entityMatcher != null;
+		}
+
 		public boolean matches(BlockState state) {
-			return this.matcher.test(state);
+			return this.blockMatcher != null && this.blockMatcher.test(state);
+		}
+
+		public boolean matchesEntity(Entity entity) {
+			return this.entityMatcher != null && this.entityMatcher.test(entity);
 		}
 	}
 
@@ -233,7 +257,7 @@ public class HighlighterClient implements ClientModInitializer {
 		private static void scan(ClientLevel level, BlockPos center) {
 			List<Feature> active = new ArrayList<>();
 			for (Feature f : Feature.values()) {
-				if (f.enabled) active.add(f);
+				if (f.enabled && f.isBlock()) active.add(f);
 			}
 			if (active.isEmpty()) {
 				hits = List.of();
@@ -293,7 +317,7 @@ public class HighlighterClient implements ClientModInitializer {
 
 	/** Draws filled, translucent boxes through walls. Based on Fabric's custom render pipeline docs for 26.2. */
 	public static final class HighlightRenderer {
-		private record BoxState(int x, int y, int z, float r, float g, float b, float a) { }
+		private record BoxState(float minX, float minY, float minZ, float maxX, float maxY, float maxZ, float r, float g, float b, float a) { }
 
 		private static final RenderPipeline FILLED_THROUGH_WALLS = RenderPipelines.register(
 				RenderPipeline.builder(RenderPipelines.DEBUG_FILLED_SNIPPET)
@@ -319,20 +343,46 @@ public class HighlighterClient implements ClientModInitializer {
 
 		// Extraction phase: copy everything we need into immutable state.
 		private static void extract(LevelExtractionContext context) {
-			List<BlockScanner.Hit> hits = BlockScanner.hits();
-			if (hits.isEmpty() || Minecraft.getInstance().level == null) {
+			Minecraft mc = Minecraft.getInstance();
+			if (mc.level == null || mc.player == null) {
 				boxes = List.of();
 				return;
 			}
-			List<BoxState> out = new ArrayList<>(hits.size());
-			for (BlockScanner.Hit hit : hits) {
+			List<BoxState> out = new ArrayList<>();
+
+			// Blocks (from the scanner cache)
+			for (BlockScanner.Hit hit : BlockScanner.hits()) {
 				Feature f = hit.feature();
 				if (!f.enabled) continue;
-				int c = f.argb;
-				out.add(new BoxState(hit.x(), hit.y(), hit.z(),
-						((c >> 16) & 0xFF) / 255f, ((c >> 8) & 0xFF) / 255f, (c & 0xFF) / 255f, ((c >>> 24) & 0xFF) / 255f));
+				out.add(box(hit.x(), hit.y(), hit.z(), hit.x() + 1, hit.y() + 1, hit.z() + 1, f.argb));
+			}
+
+			// Entities (computed every frame so they move smoothly)
+			List<Feature> entityFeatures = new ArrayList<>();
+			for (Feature f : Feature.values()) {
+				if (f.enabled && f.isEntity()) entityFeatures.add(f);
+			}
+			if (!entityFeatures.isEmpty()) {
+				float pt = mc.getDeltaTracker().getGameTimeDeltaPartialTick(false);
+				AABB area = mc.player.getBoundingBox().inflate(Config.range);
+				double range2 = (double) Config.range * Config.range;
+				for (Entity e : mc.level.getEntities((Entity) null, area, other -> other != mc.player)) {
+					if (e.distanceToSqr(mc.player) > range2) continue;
+					for (Feature f : entityFeatures) {
+						if (!f.matchesEntity(e)) continue;
+						Vec3 p = e.getPosition(pt);
+						AABB bb = e.getBoundingBox().move(p.x - e.getX(), p.y - e.getY(), p.z - e.getZ());
+						out.add(box((float) bb.minX, (float) bb.minY, (float) bb.minZ, (float) bb.maxX, (float) bb.maxY, (float) bb.maxZ, f.argb));
+						break;
+					}
+				}
 			}
 			boxes = out;
+		}
+
+		private static BoxState box(float x1, float y1, float z1, float x2, float y2, float z2, int c) {
+			return new BoxState(x1, y1, z1, x2, y2, z2,
+					((c >> 16) & 0xFF) / 255f, ((c >> 8) & 0xFF) / 255f, (c & 0xFF) / 255f, ((c >>> 24) & 0xFF) / 255f);
 		}
 
 		// Drawing phase.
@@ -353,7 +403,7 @@ public class HighlighterClient implements ClientModInitializer {
 				VertexConsumer builder = STAGED_BUFFER.getVertexBuilder(draw);
 				Matrix4fc pose = matrices.last().pose();
 				for (BoxState b : boxes) {
-					filledBox(pose, builder, b.x(), b.y(), b.z(), b.x() + 1, b.y() + 1, b.z() + 1, b.r(), b.g(), b.b(), b.a());
+					filledBox(pose, builder, b.minX(), b.minY(), b.minZ(), b.maxX(), b.maxY(), b.maxZ(), b.r(), b.g(), b.b(), b.a());
 				}
 			}
 			matrices.popPose();
@@ -588,8 +638,9 @@ public class HighlighterClient implements ClientModInitializer {
 
 		private static List<Section> buildSections() {
 			List<Row> highlights = new ArrayList<>();
+			List<Row> entities = new ArrayList<>();
 			for (Feature f : Feature.values()) {
-				highlights.add(Row.feature(f));
+				(f.isEntity() ? entities : highlights).add(Row.feature(f));
 			}
 			highlights.add(Row.cycle("Range", () -> Config.range + " blocks", dir -> {
 				int idx = 0;
@@ -610,6 +661,7 @@ public class HighlighterClient implements ClientModInitializer {
 			// Add more sections here later, e.g. new Section("Movement", List.of(...))
 			List<Section> out = new ArrayList<>();
 			out.add(new Section("Highlights", highlights));
+			out.add(new Section("Entities", entities));
 			out.add(new Section("Utilities", utilities));
 			return out;
 		}
