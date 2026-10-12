@@ -1,11 +1,15 @@
 package com.blockhighlighter;
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.io.Reader;
 import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.function.BooleanSupplier;
+import java.util.function.IntConsumer;
+import java.util.function.Supplier;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalDouble;
@@ -27,6 +31,7 @@ import org.joml.Matrix4fc;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
 import net.minecraft.client.KeyMapping;
+import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.client.gui.screens.Screen;
@@ -58,6 +63,7 @@ import net.fabricmc.loader.api.FabricLoader;
 public class HighlighterClient implements ClientModInitializer {
 	public static final String MOD_ID = "blockhighlighter";
 	public static KeyMapping OPEN_KEY;
+	public static KeyMapping ZOOM_KEY;
 
 	public static Identifier id(String path) {
 		return Identifier.fromNamespaceAndPath(MOD_ID, path);
@@ -75,6 +81,12 @@ public class HighlighterClient implements ClientModInitializer {
 				InputConstants.KEY_RSHIFT,
 				category
 		));
+		ZOOM_KEY = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+				"key.blockhighlighter.zoom",
+				InputConstants.Type.KEYSYM,
+				InputConstants.KEY_C,
+				category
+		));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			while (OPEN_KEY.consumeClick()) {
@@ -83,7 +95,11 @@ public class HighlighterClient implements ClientModInitializer {
 				}
 			}
 			BlockScanner.tick(client);
+			Zoom.tick(client);
 		});
+
+		LevelRenderEvents.START_MAIN.register(ctx -> Zoom.frame(Minecraft.getInstance()));
+		ClientLifecycleEvents.CLIENT_STOPPING.register(client -> Zoom.restore(client));
 
 		HighlightRenderer.register();
 	}
@@ -122,6 +138,11 @@ public class HighlighterClient implements ClientModInitializer {
 
 	public static final class Config {
 		public static final int[] RANGES = {16, 32, 48, 64, 96, 200, 300, 400};
+		public static final int[] ZOOM_LEVELS = {2, 3, 4, 6, 8, 10, 15, 20};
+		public static boolean zoomEnabled = true;
+		public static boolean zoomSmooth = true;
+		public static boolean zoomLowerSens = true;
+		public static int zoomIndex = 2;
 		public static int range = 48;
 
 		private Config() { }
@@ -153,6 +174,14 @@ public class HighlighterClient implements ClientModInitializer {
 			} catch (NumberFormatException ignored) {
 				range = 48;
 			}
+			zoomEnabled = Boolean.parseBoolean(p.getProperty("zoom.enabled", "true"));
+			zoomSmooth = Boolean.parseBoolean(p.getProperty("zoom.smooth", "true"));
+			zoomLowerSens = Boolean.parseBoolean(p.getProperty("zoom.lowersens", "true"));
+			try {
+				zoomIndex = Math.max(0, Math.min(ZOOM_LEVELS.length - 1, Integer.parseInt(p.getProperty("zoom.index", "2"))));
+			} catch (NumberFormatException ignored) {
+				zoomIndex = 2;
+			}
 		}
 
 		public static void save() {
@@ -163,6 +192,10 @@ public class HighlighterClient implements ClientModInitializer {
 				p.setProperty(key + ".color", Integer.toHexString(feat.argb));
 			}
 			p.setProperty("range", String.valueOf(range));
+			p.setProperty("zoom.enabled", String.valueOf(zoomEnabled));
+			p.setProperty("zoom.smooth", String.valueOf(zoomSmooth));
+			p.setProperty("zoom.lowersens", String.valueOf(zoomLowerSens));
+			p.setProperty("zoom.index", String.valueOf(zoomIndex));
 			try (Writer w = Files.newBufferedWriter(file())) {
 				p.store(w, "Block Highlighter");
 			} catch (IOException ignored) {
@@ -391,24 +424,199 @@ public class HighlighterClient implements ClientModInitializer {
 	 * The dropdown menu. Left click a row to toggle it. Right click a row (or click its swatch) to edit its color.
 	 * Press the open key again (or Esc) to close.
 	 */
+	/**
+	 * Hold-to-zoom. Works by temporarily overriding the FOV (and optionally sensitivity) options while the key is held,
+	 * then restoring your real values. No mixins needed.
+	 */
+	public static final class Zoom {
+		private static Field valueField;
+		private static boolean reflectionFailed = false;
+
+		private static boolean active = false;
+		private static int savedFov;
+		private static double savedSens;
+		private static double factor = 1.0;
+		private static long lastNs = 0;
+
+		private Zoom() { }
+
+		public static double targetLevel() {
+			return Config.ZOOM_LEVELS[Config.zoomIndex];
+		}
+
+		/** Runs every frame (from the level render event). */
+		public static void frame(Minecraft mc) {
+			if (mc.options == null) return;
+			long now = System.nanoTime();
+			double dt = lastNs == 0 ? 0.016 : Math.min(0.1, (now - lastNs) / 1e9);
+			lastNs = now;
+
+			boolean want = Config.zoomEnabled && mc.player != null && mc.level != null
+					&& mc.gui.screen() == null && ZOOM_KEY.isDown();
+
+			if (!active && !want) return;
+
+			OptionInstance<Integer> fovOpt = mc.options.fov();
+			OptionInstance<Double> sensOpt = mc.options.sensitivity();
+
+			if (!active) {
+				savedFov = fovOpt.get();
+				savedSens = sensOpt.get();
+				factor = 1.0;
+				active = true;
+			}
+
+			double target = want ? targetLevel() : 1.0;
+			if (Config.zoomSmooth) {
+				factor += (target - factor) * (1.0 - Math.exp(-dt * 16.0));
+			} else {
+				factor = target;
+			}
+
+			if (!want && Math.abs(factor - 1.0) < 0.02) {
+				restore(mc);
+				return;
+			}
+
+			setValue(fovOpt, Math.max(1, (int) Math.round(savedFov / factor)), Math.max(30, (int) Math.round(savedFov / factor)));
+			if (Config.zoomLowerSens) {
+				double s = savedSens / Math.pow(factor, 0.8);
+				setValue(sensOpt, s, Math.max(0.0, Math.min(1.0, s)));
+			}
+		}
+
+		/** Safety net: if the world closes while zooming, put the options back. */
+		public static void tick(Minecraft mc) {
+			if (active && (mc.level == null || mc.player == null)) restore(mc);
+		}
+
+		public static void restore(Minecraft mc) {
+			if (!active || mc == null || mc.options == null) return;
+			setValue(mc.options.fov(), savedFov, savedFov);
+			setValue(mc.options.sensitivity(), savedSens, savedSens);
+			active = false;
+			factor = 1.0;
+		}
+
+		/** Writes straight into the option's field so values outside the slider's range (like FOV 10) are allowed. */
+		private static <T> void setValue(OptionInstance<T> opt, T value, T clampedFallback) {
+			if (!reflectionFailed) {
+				try {
+					if (valueField == null) {
+						valueField = OptionInstance.class.getDeclaredField("value");
+						valueField.setAccessible(true);
+					}
+					valueField.set(opt, value);
+					return;
+				} catch (ReflectiveOperationException | RuntimeException e) {
+					reflectionFailed = true;
+				}
+			}
+			opt.set(clampedFallback);
+		}
+	}
+
+	/** One line in the menu. */
+	private static final class Row {
+		final String label;
+		final Feature feature;          // highlight rows (checkbox + color swatch)
+		final BooleanSupplier checked;  // toggle rows (checkbox only)
+		final Runnable toggle;
+		final Supplier<String> value;   // cycle rows (shows a value, click to change)
+		final IntConsumer cycle;
+
+		private Row(String label, Feature feature, BooleanSupplier checked, Runnable toggle, Supplier<String> value, IntConsumer cycle) {
+			this.label = label;
+			this.feature = feature;
+			this.checked = checked;
+			this.toggle = toggle;
+			this.value = value;
+			this.cycle = cycle;
+		}
+
+		static Row feature(Feature f) {
+			return new Row(f.label, f, () -> f.enabled, () -> {
+				f.enabled = !f.enabled;
+				BlockScanner.requestRescan();
+			}, null, null);
+		}
+
+		static Row toggle(String label, BooleanSupplier checked, Runnable toggle) {
+			return new Row(label, null, checked, toggle, null, null);
+		}
+
+		static Row cycle(String label, Supplier<String> value, IntConsumer cycle) {
+			return new Row(label, null, null, null, value, cycle);
+		}
+	}
+
+	/** A collapsible group of rows. To add a new section, add one more entry in HighlightScreen's constructor. */
+	private static final class Section {
+		final String title;
+		final List<Row> rows;
+		boolean collapsed = false;
+
+		Section(String title, List<Row> rows) {
+			this.title = title;
+			this.rows = rows;
+		}
+	}
+
+	/**
+	 * The menu. Left click a row to toggle/change it. Right click a highlight row (or click its swatch) to edit its color.
+	 * Click a section header to collapse it. Press the open key again (or Esc) to close.
+	 */
 	public static class HighlightScreen extends Screen {
 		private static final int PX = 8, PY = 8, W = 190, HEADER_H = 16, ROW_H = 16;
 		private static final int POP_W = 150, SLIDER_H = 14;
 		private static final String[] CHANNELS = {"R", "G", "B", "A"};
 		private static final int[] SHIFTS = {16, 8, 0, 24};
 
-		private static boolean collapsed = false;
+		// Kept static so sections stay collapsed/expanded between openings.
+		private static List<Section> sections;
 
 		private Feature picker = null;
+		private int pickerY = 0;
 		private int dragging = -1;
 
 		public HighlightScreen() {
 			super(Component.literal("Block Highlighter"));
+			if (sections == null) {
+				sections = buildSections();
+			}
+		}
+
+		private static List<Section> buildSections() {
+			List<Row> highlights = new ArrayList<>();
+			for (Feature f : Feature.values()) {
+				highlights.add(Row.feature(f));
+			}
+			highlights.add(Row.cycle("Range", () -> Config.range + " blocks", dir -> {
+				int idx = 0;
+				for (int i = 0; i < Config.RANGES.length; i++) {
+					if (Config.RANGES[i] == Config.range) idx = i;
+				}
+				Config.range = Config.RANGES[Math.floorMod(idx + dir, Config.RANGES.length)];
+				BlockScanner.requestRescan();
+			}));
+
+			List<Row> utilities = new ArrayList<>();
+			utilities.add(Row.toggle("Zoom (hold C)", () -> Config.zoomEnabled, () -> Config.zoomEnabled = !Config.zoomEnabled));
+			utilities.add(Row.cycle("Zoom level", () -> Config.ZOOM_LEVELS[Config.zoomIndex] + "x",
+					dir -> Config.zoomIndex = Math.floorMod(Config.zoomIndex + dir, Config.ZOOM_LEVELS.length)));
+			utilities.add(Row.toggle("Smooth zoom", () -> Config.zoomSmooth, () -> Config.zoomSmooth = !Config.zoomSmooth));
+			utilities.add(Row.toggle("Lower sensitivity", () -> Config.zoomLowerSens, () -> Config.zoomLowerSens = !Config.zoomLowerSens));
+
+			// Add more sections here later, e.g. new Section("Movement", List.of(...))
+			List<Section> out = new ArrayList<>();
+			out.add(new Section("Highlights", highlights));
+			out.add(new Section("Utilities", utilities));
+			return out;
 		}
 
 		@Override
 		public boolean isPauseScreen() {
-			return false; // keep the world running so you can see highlight changes live
+			return false; // keep the world running so you can see changes live
 		}
 
 		@Override
@@ -417,61 +625,79 @@ public class HighlighterClient implements ClientModInitializer {
 			super.onClose();
 		}
 
-		private int rowY(int i) {
-			return PY + HEADER_H + i * ROW_H;
+		/** One drawable line: either a section header (row == null) or a row. */
+		private record Slot(int y, Section section, Row row) { }
+
+		private List<Slot> layout() {
+			List<Slot> slots = new ArrayList<>();
+			int y = PY;
+			for (Section sec : sections) {
+				slots.add(new Slot(y, sec, null));
+				y += HEADER_H;
+				if (!sec.collapsed) {
+					for (Row r : sec.rows) {
+						slots.add(new Slot(y, sec, r));
+						y += ROW_H;
+					}
+				}
+				y += 4;
+			}
+			return slots;
 		}
 
 		private int popX() {
 			return PX + W + 6;
 		}
 
-		private int popY() {
-			int idx = picker == null ? 0 : picker.ordinal();
-			return rowY(idx);
+		private int sliderY(int i) {
+			return pickerY + 16 + i * (SLIDER_H + 4);
 		}
 
-		private int sliderY(int i) {
-			return popY() + 16 + i * (SLIDER_H + 4);
+		private int popH() {
+			return 16 + 4 * (SLIDER_H + 4) + 30;
 		}
 
 		@Override
 		public void extractRenderState(GuiGraphicsExtractor g, int mouseX, int mouseY, float delta) {
 			// No super call: we deliberately skip the dimmed/blurred background so you can see the world.
-			Feature[] features = Feature.values();
+			int lastY = PY;
+			for (Slot slot : layout()) {
+				int y = slot.y();
+				lastY = y + (slot.row() == null ? HEADER_H : ROW_H);
+				if (slot.row() == null) {
+					g.fill(PX, y, PX + W, y + HEADER_H, 0xE0181818);
+					g.text(this.font, (slot.section().collapsed ? "[+] " : "[-] ") + slot.section().title, PX + 6, y + 4, 0xFFFFFFFF, true);
+					continue;
+				}
+				Row r = slot.row();
+				boolean hover = mouseX >= PX && mouseX < PX + W && mouseY >= y && mouseY < y + ROW_H;
+				g.fill(PX, y, PX + W, y + ROW_H, hover ? 0xE0383838 : 0xE0262626);
 
-			g.fill(PX, PY, PX + W, PY + HEADER_H, 0xE0181818);
-			g.text(this.font, (collapsed ? "[+] " : "[-] ") + "Block Highlighter", PX + 6, PY + 4, 0xFFFFFFFF, true);
+				if (r.value != null) {
+					g.text(this.font, r.label, PX + 6, y + 4, 0xFFDDDDDD, true);
+					String v = r.value.get();
+					g.text(this.font, v, PX + W - 6 - this.font.width(v), y + 4, 0xFFFFFF55, true);
+					continue;
+				}
 
-			if (collapsed) return;
+				boolean on = r.checked.getAsBoolean();
+				g.outline(PX + 5, y + 3, 10, 10, 0xFFAAAAAA);
+				if (on) g.fill(PX + 7, y + 5, PX + 13, y + 11, 0xFF55FF55);
+				g.text(this.font, r.label, PX + 20, y + 4, on ? 0xFFFFFFFF : 0xFF888888, true);
 
-			for (int i = 0; i < features.length; i++) {
-				Feature f = features[i];
-				int ry = rowY(i);
-				boolean hover = mouseX >= PX && mouseX < PX + W && mouseY >= ry && mouseY < ry + ROW_H;
-				g.fill(PX, ry, PX + W, ry + ROW_H, hover ? 0xE0383838 : 0xE0262626);
-
-				g.outline(PX + 5, ry + 3, 10, 10, 0xFFAAAAAA);
-				if (f.enabled) g.fill(PX + 7, ry + 5, PX + 13, ry + 11, 0xFF55FF55);
-
-				g.text(this.font, f.label, PX + 20, ry + 4, f.enabled ? 0xFFFFFFFF : 0xFF888888, true);
-
-				g.fill(PX + W - 24, ry + 3, PX + W - 6, ry + 13, f.argb | 0xFF000000);
-				g.outline(PX + W - 24, ry + 3, 18, 10, picker == f ? 0xFFFFFF55 : 0xFFFFFFFF);
+				if (r.feature != null) {
+					g.fill(PX + W - 24, y + 3, PX + W - 6, y + 13, r.feature.argb | 0xFF000000);
+					g.outline(PX + W - 24, y + 3, 18, 10, picker == r.feature ? 0xFFFFFF55 : 0xFFFFFFFF);
+				}
 			}
 
-			int ry = rowY(features.length);
-			g.fill(PX, ry, PX + W, ry + ROW_H, 0xE0262626);
-			g.text(this.font, "Range: " + Config.range + " blocks", PX + 6, ry + 4, 0xFFDDDDDD, true);
-			g.text(this.font, "Left/right click", PX + W - 6 - this.font.width("Left/right click"), ry + 4, 0xFF777777, false);
-
-			g.text(this.font, "Click: toggle  |  Right-click: color", PX, ry + ROW_H + 4, 0xFFCCCCCC, true);
+			g.text(this.font, "Click: toggle/change  |  Right-click: color / back", PX, lastY + 8, 0xFFCCCCCC, true);
 
 			if (picker != null) extractPicker(g);
 		}
 
 		private void extractPicker(GuiGraphicsExtractor g) {
-			int x = popX(), y = popY();
-			int h = 16 + 4 * (SLIDER_H + 4) + 30;
+			int x = popX(), y = pickerY, h = popH();
 			g.fill(x, y, x + POP_W, y + h, 0xF0181818);
 			g.outline(x, y, POP_W, h, 0xFF666666);
 			g.text(this.font, picker.label + " color", x + 6, y + 4, 0xFFFFFFFF, true);
@@ -485,7 +711,7 @@ public class HighlighterClient implements ClientModInitializer {
 				g.text(this.font, CHANNELS[i] + " " + value, tx + 4, sy + 3, 0xFFFFFFFF, true);
 			}
 
-			int py = sliderY(4) + 0;
+			int py = sliderY(4);
 			g.fill(x + 8, py, x + POP_W - 8, py + 12, picker.argb | 0xFF000000);
 			g.outline(x + 8, py, POP_W - 16, 12, 0xFFFFFFFF);
 			g.text(this.font, String.format("#%06X  alpha %d", picker.argb & 0xFFFFFF, (picker.argb >>> 24) & 0xFF), x + 8, py + 15, 0xFFAAAAAA, false);
@@ -512,10 +738,9 @@ public class HighlighterClient implements ClientModInitializer {
 		public boolean mouseClicked(MouseButtonEvent event, boolean doubleClick) {
 			double mx = event.x(), my = event.y();
 			int button = event.button();
-			Feature[] features = Feature.values();
 
 			// Color picker sliders
-			if (picker != null && mx >= popX() && mx < popX() + POP_W) {
+			if (picker != null && mx >= popX() && mx < popX() + POP_W && my >= pickerY && my < pickerY + popH()) {
 				for (int i = 0; i < 4; i++) {
 					int sy = sliderY(i);
 					if (my >= sy && my < sy + SLIDER_H) {
@@ -524,45 +749,36 @@ public class HighlighterClient implements ClientModInitializer {
 						return true;
 					}
 				}
-				if (my >= popY() && my < popY() + 16 + 4 * (SLIDER_H + 4) + 30) return true;
-			}
-
-			// Header: collapse / expand
-			if (mx >= PX && mx < PX + W && my >= PY && my < PY + HEADER_H) {
-				collapsed = !collapsed;
-				if (collapsed) picker = null;
 				return true;
 			}
-			if (collapsed) return super.mouseClicked(event, doubleClick);
 
-			// Feature rows
-			for (int i = 0; i < features.length; i++) {
-				int ry = rowY(i);
-				if (mx >= PX && mx < PX + W && my >= ry && my < ry + ROW_H) {
-					Feature f = features[i];
-					boolean onSwatch = mx >= PX + W - 24;
-					if (button == 1 || onSwatch) {
-						picker = (picker == f) ? null : f;
-					} else if (button == 0) {
-						f.enabled = !f.enabled;
-						BlockScanner.requestRescan();
-						Config.save();
-					}
+			for (Slot slot : layout()) {
+				int y = slot.y();
+				int h = slot.row() == null ? HEADER_H : ROW_H;
+				if (mx < PX || mx >= PX + W || my < y || my >= y + h) continue;
+
+				if (slot.row() == null) {
+					slot.section().collapsed = !slot.section().collapsed;
+					picker = null;
 					return true;
 				}
-			}
 
-			// Range row
-			int ry = rowY(features.length);
-			if (mx >= PX && mx < PX + W && my >= ry && my < ry + ROW_H) {
-				int idx = 0;
-				for (int i = 0; i < Config.RANGES.length; i++) {
-					if (Config.RANGES[i] == Config.range) idx = i;
+				Row r = slot.row();
+				if (r.feature != null) {
+					boolean onSwatch = mx >= PX + W - 24;
+					if (button == 1 || onSwatch) {
+						picker = (picker == r.feature) ? null : r.feature;
+						pickerY = y;
+						return true;
+					}
 				}
-				int step = button == 1 ? -1 : 1;
-				idx = Math.floorMod(idx + step, Config.RANGES.length);
-				Config.range = Config.RANGES[idx];
-				BlockScanner.requestRescan();
+				if (r.cycle != null) {
+					r.cycle.accept(button == 1 ? -1 : 1);
+				} else if (button == 0) {
+					r.toggle.run();
+				} else {
+					return true;
+				}
 				Config.save();
 				return true;
 			}
