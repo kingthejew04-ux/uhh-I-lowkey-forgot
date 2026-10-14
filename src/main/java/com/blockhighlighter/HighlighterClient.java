@@ -58,6 +58,7 @@ import net.minecraft.resources.Identifier;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.ShulkerBoxBlock;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.level.chunk.LevelChunk;
 import net.minecraft.world.level.chunk.LevelChunkSection;
 import net.minecraft.world.phys.Vec3;
@@ -236,6 +237,9 @@ public class HighlighterClient implements ClientModInitializer {
 				finderSens = 1;
 				finderDist = 3;
 			}
+			for (Indicator ind : Indicator.values()) {
+				ind.enabled = Boolean.parseBoolean(p.getProperty("indicator." + ind.name().toLowerCase(), "true"));
+			}
 		}
 
 		public static void save() {
@@ -252,6 +256,9 @@ public class HighlighterClient implements ClientModInitializer {
 			p.setProperty("zoom.index", String.valueOf(zoomIndex));
 			p.setProperty("finder.sens", String.valueOf(finderSens));
 			p.setProperty("finder.dist", String.valueOf(finderDist));
+			for (Indicator ind : Indicator.values()) {
+				p.setProperty("indicator." + ind.name().toLowerCase(), String.valueOf(ind.enabled));
+			}
 			try (Writer w = Files.newBufferedWriter(file())) {
 				p.store(w, "Block Highlighter");
 			} catch (IOException ignored) {
@@ -518,6 +525,31 @@ public class HighlighterClient implements ClientModInitializer {
 	 * Press the open key again (or Esc) to close.
 	 */
 	/**
+	 * Things Chunk Finder looks for. "Growth" indicators only reach these states when a chunk has been loaded and ticking
+	 * for a while (plants grow, bees fill nests), which suggests someone spent time nearby.
+	 */
+	public enum Indicator {
+		PLACED("Player-made blocks", 30),
+		AMETHYST("Grown amethyst", 15),
+		KELP("Fully grown kelp", 15),
+		CAVE_VINES("Glow berries", 15),
+		BAMBOO("Mature bamboo", 15),
+		COCOA("Ripe cocoa", 15),
+		BEE_NESTS("Full honey nests", 15),
+		SWEET_BERRIES("Ripe sweet berries", 15);
+
+		public final String label;
+		/** Max points one indicator can add to a chunk, so one common plant can't flag a chunk alone at higher thresholds. */
+		public final int cap;
+		public boolean enabled = true;
+
+		Indicator(String label, int cap) {
+			this.label = label;
+			this.cap = cap;
+		}
+	}
+
+	/**
 	 * Chunk Finder: scores every loaded chunk by how many player-placed-looking blocks it contains and flags the ones
 	 * over the sensitivity threshold. Only chunks your game has loaded can be scanned. Scanning is spread over many ticks
 	 * so it never causes a lag spike.
@@ -541,6 +573,8 @@ public class HighlighterClient implements ClientModInitializer {
 
 		private static final Map<Block, Integer> WEIGHTS = new IdentityHashMap<>();
 		private static final Map<Long, Result> results = new HashMap<>();
+		private static final Map<BlockState, int[]> STATE_WEIGHTS = new IdentityHashMap<>();
+		private static final int[] NONE = new int[0];
 		private static List<Result> flagged = List.of();
 		private static long ticks = 0;
 		private static int cursor = 0;
@@ -555,7 +589,7 @@ public class HighlighterClient implements ClientModInitializer {
 			return ((long) cx & 0xFFFFFFFFL) | ((long) cz << 32);
 		}
 
-		private static int weight(BlockState state) {
+		private static int placedWeight(BlockState state) {
 			Block block = state.getBlock();
 			Integer cached = WEIGHTS.get(block);
 			if (cached != null) return cached;
@@ -621,25 +655,93 @@ public class HighlighterClient implements ClientModInitializer {
 			}
 		}
 
+		/** Call after changing which indicators are enabled so chunks get rescored. */
+		public static void invalidate() {
+			results.clear();
+			flagged = List.of();
+		}
+
+		/** Points each indicator awards for this block state (indexed by Indicator ordinal). Cached per state. */
+		private static int[] weights(BlockState s) {
+			int[] cached = STATE_WEIGHTS.get(s);
+			if (cached != null) return cached;
+
+			int[] w = new int[Indicator.values().length];
+			w[Indicator.PLACED.ordinal()] = placedWeight(s);
+			if (s.is(Blocks.AMETHYST_CLUSTER)) {
+				w[Indicator.AMETHYST.ordinal()] = 3;
+			} else if (s.is(Blocks.LARGE_AMETHYST_BUD)) {
+				w[Indicator.AMETHYST.ordinal()] = 2;
+			}
+			if (s.is(Blocks.KELP) && s.getValue(BlockStateProperties.AGE_25) >= 24) {
+				w[Indicator.KELP.ordinal()] = 2;
+			}
+			if ((s.is(Blocks.CAVE_VINES) || s.is(Blocks.CAVE_VINES_PLANT)) && s.getValue(BlockStateProperties.BERRIES)) {
+				w[Indicator.CAVE_VINES.ordinal()] = 1;
+			}
+			if (s.is(Blocks.BAMBOO) && s.getValue(BlockStateProperties.AGE_1) == 1) {
+				w[Indicator.BAMBOO.ordinal()] = 1;
+			}
+			if (s.is(Blocks.COCOA) && s.getValue(BlockStateProperties.AGE_2) == 2) {
+				w[Indicator.COCOA.ordinal()] = 2;
+			}
+			if ((s.is(Blocks.BEE_NEST) || s.is(Blocks.BEEHIVE)) && s.getValue(BlockStateProperties.LEVEL_HONEY) == 5) {
+				w[Indicator.BEE_NESTS.ordinal()] = 3;
+			}
+			if (s.is(Blocks.SWEET_BERRY_BUSH) && s.getValue(BlockStateProperties.AGE_3) == 3) {
+				w[Indicator.SWEET_BERRIES.ordinal()] = 2;
+			}
+
+			int[] result = NONE;
+			for (int v : w) {
+				if (v > 0) {
+					result = w;
+					break;
+				}
+			}
+			STATE_WEIGHTS.put(s, result);
+			return result;
+		}
+
+		/** True if this state matters to at least one enabled indicator. */
+		private static boolean relevant(BlockState s) {
+			int[] w = weights(s);
+			if (w == NONE) return false;
+			Indicator[] inds = Indicator.values();
+			for (int i = 0; i < inds.length; i++) {
+				if (w[i] > 0 && inds[i].enabled) return true;
+			}
+			return false;
+		}
+
 		private static Result scanChunk(ClientLevel level, int cx, int cz) {
 			LevelChunk chunk = level.getChunk(cx, cz);
 			LevelChunkSection[] sections = chunk.getSections();
 			int minWorldY = level.getMinY();
-			int score = 0, count = 0;
+			Indicator[] inds = Indicator.values();
+			int[] sums = new int[inds.length];
+			int count = 0;
 			long sumY = 0;
 			int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
 
 			for (int i = 0; i < sections.length; i++) {
 				LevelChunkSection section = sections[i];
-				if (section.hasOnlyAir() || !section.maybeHas(s -> weight(s) > 0)) continue;
+				if (section.hasOnlyAir() || !section.maybeHas(ChunkFinder::relevant)) continue;
 				int baseY = minWorldY + i * 16;
 				for (int y = 0; y < 16; y++) {
 					for (int z = 0; z < 16; z++) {
 						for (int x = 0; x < 16; x++) {
-							int w = weight(section.getBlockState(x, y, z));
-							if (w <= 0) continue;
+							int[] w = weights(section.getBlockState(x, y, z));
+							if (w == NONE) continue;
+							boolean hit = false;
+							for (int k = 0; k < inds.length; k++) {
+								if (w[k] > 0 && inds[k].enabled) {
+									sums[k] += w[k];
+									hit = true;
+								}
+							}
+							if (!hit) continue;
 							int wy = baseY + y;
-							score += w;
 							count++;
 							sumY += wy;
 							minY = Math.min(minY, wy);
@@ -647,6 +749,11 @@ public class HighlighterClient implements ClientModInitializer {
 						}
 					}
 				}
+			}
+
+			int score = 0;
+			for (int k = 0; k < inds.length; k++) {
+				score += Math.min(sums[k], inds[k].cap);
 			}
 			float meanY = count == 0 ? 0f : (float) sumY / count;
 			return new Result(cx, cz, score, meanY, count == 0 ? 0 : minY, count == 0 ? 0 : maxY, ticks);
@@ -806,6 +913,8 @@ public class HighlighterClient implements ClientModInitializer {
 
 		private Feature picker = null;
 		private int pickerY = 0;
+		private boolean indicatorsOpen = false;
+		private int indicatorsY = 0;
 		private int dragging = -1;
 
 		public HighlightScreen() {
@@ -931,9 +1040,30 @@ public class HighlighterClient implements ClientModInitializer {
 				}
 			}
 
-			g.text(this.font, "Click: toggle/change  |  Right-click: color / back", PX, lastY + 8, 0xFFCCCCCC, true);
+			g.text(this.font, "Click: toggle  |  Right-click: color / indicators", PX, lastY + 8, 0xFFCCCCCC, true);
 
 			if (picker != null) extractPicker(g);
+			if (indicatorsOpen) extractIndicators(g, mouseX, mouseY);
+		}
+
+		private int indicatorsH() {
+			return 16 + Indicator.values().length * ROW_H + 4;
+		}
+
+		private void extractIndicators(GuiGraphicsExtractor g, int mouseX, int mouseY) {
+			int x = popX(), y = indicatorsY, h = indicatorsH();
+			g.fill(x, y, x + POP_W, y + h, 0xF0181818);
+			g.outline(x, y, POP_W, h, 0xFF666666);
+			g.text(this.font, "Chunk Finder indicators", x + 6, y + 4, 0xFFFFFFFF, true);
+			Indicator[] inds = Indicator.values();
+			for (int i = 0; i < inds.length; i++) {
+				int ry = y + 16 + i * ROW_H;
+				boolean hover = mouseX >= x && mouseX < x + POP_W && mouseY >= ry && mouseY < ry + ROW_H;
+				if (hover) g.fill(x + 1, ry, x + POP_W - 1, ry + ROW_H, 0xE0383838);
+				g.outline(x + 6, ry + 3, 10, 10, 0xFFAAAAAA);
+				if (inds[i].enabled) g.fill(x + 8, ry + 5, x + 14, ry + 11, 0xFF55FF55);
+				g.text(this.font, inds[i].label, x + 22, ry + 4, inds[i].enabled ? 0xFFFFFFFF : 0xFF888888, true);
+			}
 		}
 
 		private void extractPicker(GuiGraphicsExtractor g) {
@@ -979,6 +1109,18 @@ public class HighlighterClient implements ClientModInitializer {
 			double mx = event.x(), my = event.y();
 			int button = event.button();
 
+			// Chunk Finder indicator popup
+			if (indicatorsOpen && mx >= popX() && mx < popX() + POP_W && my >= indicatorsY && my < indicatorsY + indicatorsH()) {
+				int idx = (int) ((my - indicatorsY - 16) / ROW_H);
+				Indicator[] inds = Indicator.values();
+				if (my >= indicatorsY + 16 && idx >= 0 && idx < inds.length) {
+					inds[idx].enabled = !inds[idx].enabled;
+					ChunkFinder.invalidate();
+					Config.save();
+				}
+				return true;
+			}
+
 			// Color picker sliders
 			if (picker != null && mx >= popX() && mx < popX() + POP_W && my >= pickerY && my < pickerY + popH()) {
 				for (int i = 0; i < 4; i++) {
@@ -1000,15 +1142,24 @@ public class HighlighterClient implements ClientModInitializer {
 				if (slot.row() == null) {
 					slot.section().collapsed = !slot.section().collapsed;
 					picker = null;
+					indicatorsOpen = false;
 					return true;
 				}
 
 				Row r = slot.row();
 				if (r.feature != null) {
 					boolean onSwatch = mx >= PX + W - 24;
+					if (r.feature == Feature.CHUNK_FINDER && button == 1 && !onSwatch) {
+						// Right-click the Chunk Finder row: choose which indicators it looks for
+						indicatorsOpen = !indicatorsOpen;
+						indicatorsY = y;
+						picker = null;
+						return true;
+					}
 					if (button == 1 || onSwatch) {
 						picker = (picker == r.feature) ? null : r.feature;
 						pickerY = y;
+						indicatorsOpen = false;
 						return true;
 					}
 				}
