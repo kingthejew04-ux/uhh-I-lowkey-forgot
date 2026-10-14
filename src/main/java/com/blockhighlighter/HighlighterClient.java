@@ -181,11 +181,19 @@ public class HighlighterClient implements ClientModInitializer {
 		public static final String[] FINDER_SENS_NAMES = {"Low", "Medium", "High", "Max"};
 		public static final int[] FINDER_THRESHOLDS = {60, 25, 10, 4};
 		public static final int[] FINDER_DISTANCES = {2, 4, 6, 8, 12, 16, 24, 32};
+		public static final String[] FINDER_DEPTH_NAMES = {"Any", "Y < 60", "Y < 45", "Y < 30", "Y < 0"};
+		public static final int[] FINDER_DEPTHS = {Integer.MAX_VALUE, 60, 45, 30, 0};
+		public static int finderDepth = 1;
 		public static int finderSens = 1;
 		public static int finderDist = 3;
 
 		public static int finderThreshold() {
 			return FINDER_THRESHOLDS[finderSens];
+		}
+
+		/** Blocks at or above this Y are ignored by Chunk Finder. */
+		public static int finderMaxY() {
+			return FINDER_DEPTHS[finderDepth];
 		}
 
 		public static int finderDistance() {
@@ -237,6 +245,11 @@ public class HighlighterClient implements ClientModInitializer {
 				finderSens = 1;
 				finderDist = 3;
 			}
+			try {
+				finderDepth = Math.max(0, Math.min(FINDER_DEPTHS.length - 1, Integer.parseInt(p.getProperty("finder.depth", "1"))));
+			} catch (NumberFormatException ignored) {
+				finderDepth = 1;
+			}
 			for (Indicator ind : Indicator.values()) {
 				ind.enabled = Boolean.parseBoolean(p.getProperty("indicator." + ind.name().toLowerCase(), "true"));
 			}
@@ -256,6 +269,7 @@ public class HighlighterClient implements ClientModInitializer {
 			p.setProperty("zoom.index", String.valueOf(zoomIndex));
 			p.setProperty("finder.sens", String.valueOf(finderSens));
 			p.setProperty("finder.dist", String.valueOf(finderDist));
+			p.setProperty("finder.depth", String.valueOf(finderDepth));
 			for (Indicator ind : Indicator.values()) {
 				p.setProperty("indicator." + ind.name().toLowerCase(), String.valueOf(ind.enabled));
 			}
@@ -555,7 +569,7 @@ public class HighlighterClient implements ClientModInitializer {
 	 * so it never causes a lag spike.
 	 */
 	public static final class ChunkFinder {
-		public record Result(int cx, int cz, int score, float meanY, int minY, int maxY, long scannedTick) { }
+		public record Result(int cx, int cz, int score, float meanY, int minY, int maxY, long scannedTick, int[] sums) { }
 
 		private static final int SCANS_PER_TICK = 8;
 		private static final int CHECKS_PER_TICK = 64;
@@ -578,8 +592,28 @@ public class HighlighterClient implements ClientModInitializer {
 		private static List<Result> flagged = List.of();
 		private static long ticks = 0;
 		private static int cursor = 0;
+		private static int hereCx = 0, hereCz = 0;
 
 		private ChunkFinder() { }
+
+		/** Debug text for the menu: how many chunks were scanned and flagged. */
+		public static String scannedText() {
+			if (!Feature.CHUNK_FINDER.enabled) return "finder is off";
+			return results.size() + " chunks, " + flagged.size() + " flagged";
+		}
+
+		/** Debug text for the menu: the score of the chunk you're standing in and its strongest indicator. */
+		public static String hereText() {
+			if (!Feature.CHUNK_FINDER.enabled) return "finder is off";
+			Result r = results.get(key(hereCx, hereCz));
+			if (r == null) return "not scanned yet";
+			Indicator[] inds = Indicator.values();
+			int best = -1;
+			for (int i = 0; i < inds.length; i++) {
+				if (r.sums()[i] > 0 && (best < 0 || r.sums()[i] > r.sums()[best])) best = i;
+			}
+			return best < 0 ? r.score() + " pts" : r.score() + " (" + inds[best].label + ")";
+		}
 
 		public static List<Result> flagged() {
 			return flagged;
@@ -619,6 +653,8 @@ public class HighlighterClient implements ClientModInitializer {
 			int dist = Config.finderDistance();
 			int pcx = mc.player.blockPosition().getX() >> 4;
 			int pcz = mc.player.blockPosition().getZ() >> 4;
+			hereCx = pcx;
+			hereCz = pcz;
 			int side = dist * 2 + 1;
 			int total = side * side;
 			int dist2 = dist * dist;
@@ -718,6 +754,7 @@ public class HighlighterClient implements ClientModInitializer {
 			LevelChunk chunk = level.getChunk(cx, cz);
 			LevelChunkSection[] sections = chunk.getSections();
 			int minWorldY = level.getMinY();
+			int maxScanY = Config.finderMaxY();
 			Indicator[] inds = Indicator.values();
 			int[] sums = new int[inds.length];
 			int count = 0;
@@ -726,9 +763,11 @@ public class HighlighterClient implements ClientModInitializer {
 
 			for (int i = 0; i < sections.length; i++) {
 				LevelChunkSection section = sections[i];
-				if (section.hasOnlyAir() || !section.maybeHas(ChunkFinder::relevant)) continue;
 				int baseY = minWorldY + i * 16;
+				if (baseY >= maxScanY) break; // everything from here up is above the depth limit
+				if (section.hasOnlyAir() || !section.maybeHas(ChunkFinder::relevant)) continue;
 				for (int y = 0; y < 16; y++) {
+					if (baseY + y >= maxScanY) break;
 					for (int z = 0; z < 16; z++) {
 						for (int x = 0; x < 16; x++) {
 							int[] w = weights(section.getBlockState(x, y, z));
@@ -756,7 +795,7 @@ public class HighlighterClient implements ClientModInitializer {
 				score += Math.min(sums[k], inds[k].cap);
 			}
 			float meanY = count == 0 ? 0f : (float) sumY / count;
-			return new Result(cx, cz, score, meanY, count == 0 ? 0 : minY, count == 0 ? 0 : maxY, ticks);
+			return new Result(cx, cz, score, meanY, count == 0 ? 0 : minY, count == 0 ? 0 : maxY, ticks, sums);
 		}
 	}
 
@@ -881,6 +920,10 @@ public class HighlighterClient implements ClientModInitializer {
 			return new Row(label, null, checked, toggle, null, null);
 		}
 
+		static Row info(String label, Supplier<String> value) {
+			return new Row(label, null, null, null, value, null);
+		}
+
 		static Row cycle(String label, Supplier<String> value, IntConsumer cycle) {
 			return new Row(label, null, null, null, value, cycle);
 		}
@@ -953,6 +996,13 @@ public class HighlighterClient implements ClientModInitializer {
 					dir -> Config.finderSens = Math.floorMod(Config.finderSens + dir, Config.FINDER_THRESHOLDS.length)));
 			finder.add(Row.cycle("Scan distance", () -> Config.finderDistance() + " chunks",
 					dir -> Config.finderDist = Math.floorMod(Config.finderDist + dir, Config.FINDER_DISTANCES.length)));
+
+			finder.add(Row.cycle("Depth", () -> Config.FINDER_DEPTH_NAMES[Config.finderDepth], dir -> {
+				Config.finderDepth = Math.floorMod(Config.finderDepth + dir, Config.FINDER_DEPTHS.length);
+				ChunkFinder.invalidate();
+			}));
+			finder.add(Row.info("Scanned", ChunkFinder::scannedText));
+			finder.add(Row.info("Here", ChunkFinder::hereText));
 
 			// Add more sections here later, e.g. new Section("Movement", List.of(...))
 			List<Section> out = new ArrayList<>();
@@ -1165,7 +1215,7 @@ public class HighlighterClient implements ClientModInitializer {
 				}
 				if (r.cycle != null) {
 					r.cycle.accept(button == 1 ? -1 : 1);
-				} else if (button == 0) {
+				} else if (r.toggle != null && button == 0) {
 					r.toggle.run();
 				} else {
 					return true;
