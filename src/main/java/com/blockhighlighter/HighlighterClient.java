@@ -7,6 +7,10 @@ import java.io.Writer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.IntConsumer;
 import java.util.function.Supplier;
@@ -33,6 +37,8 @@ import org.joml.Vector4f;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.client.OptionInstance;
 import net.minecraft.client.Minecraft;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.world.level.block.Block;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.entity.monster.Enemy;
@@ -100,6 +106,7 @@ public class HighlighterClient implements ClientModInitializer {
 				}
 			}
 			BlockScanner.tick(client);
+			ChunkFinder.tick(client);
 			Zoom.tick(client);
 		});
 
@@ -119,6 +126,9 @@ public class HighlighterClient implements ClientModInitializer {
 		SHULKER("Shulker Boxes", 0x70FF70D0, false, s -> s.getBlock() instanceof ShulkerBoxBlock, null),
 		ANCIENT_DEBRIS("Ancient Debris", 0x70A06A40, false, s -> s.is(Blocks.ANCIENT_DEBRIS), null),
 		DIAMOND_ORE("Diamond Ore", 0x7040FFFF, false, s -> s.is(Blocks.DIAMOND_ORE) || s.is(Blocks.DEEPSLATE_DIAMOND_ORE), null),
+		AMETHYST_GEODES("Amethyst Geodes", 0x70C070FF, false, s -> s.is(Blocks.BUDDING_AMETHYST), null),
+		// ---- Modules (drawn by their own code, not by block/entity matching) ----
+		CHUNK_FINDER("Chunk Finder", 0x60FF8800, false, null, null),
 		// ---- Entities ----
 		PLAYERS("Players", 0x8055FF55, true, null, e -> e instanceof Player),
 		HOSTILE_MOBS("Hostile Mobs", 0x80FF5555, false, null, e -> e instanceof Enemy),
@@ -167,6 +177,19 @@ public class HighlighterClient implements ClientModInitializer {
 		public static boolean zoomSmooth = true;
 		public static boolean zoomLowerSens = true;
 		public static int zoomIndex = 2;
+		public static final String[] FINDER_SENS_NAMES = {"Low", "Medium", "High", "Max"};
+		public static final int[] FINDER_THRESHOLDS = {60, 25, 10, 4};
+		public static final int[] FINDER_DISTANCES = {2, 4, 6, 8, 12, 16, 24, 32};
+		public static int finderSens = 1;
+		public static int finderDist = 3;
+
+		public static int finderThreshold() {
+			return FINDER_THRESHOLDS[finderSens];
+		}
+
+		public static int finderDistance() {
+			return FINDER_DISTANCES[finderDist];
+		}
 		public static int range = 48;
 
 		private Config() { }
@@ -206,6 +229,13 @@ public class HighlighterClient implements ClientModInitializer {
 			} catch (NumberFormatException ignored) {
 				zoomIndex = 2;
 			}
+			try {
+				finderSens = Math.max(0, Math.min(FINDER_THRESHOLDS.length - 1, Integer.parseInt(p.getProperty("finder.sens", "1"))));
+				finderDist = Math.max(0, Math.min(FINDER_DISTANCES.length - 1, Integer.parseInt(p.getProperty("finder.dist", "3"))));
+			} catch (NumberFormatException ignored) {
+				finderSens = 1;
+				finderDist = 3;
+			}
 		}
 
 		public static void save() {
@@ -220,6 +250,8 @@ public class HighlighterClient implements ClientModInitializer {
 			p.setProperty("zoom.smooth", String.valueOf(zoomSmooth));
 			p.setProperty("zoom.lowersens", String.valueOf(zoomLowerSens));
 			p.setProperty("zoom.index", String.valueOf(zoomIndex));
+			p.setProperty("finder.sens", String.valueOf(finderSens));
+			p.setProperty("finder.dist", String.valueOf(finderDist));
 			try (Writer w = Files.newBufferedWriter(file())) {
 				p.store(w, "Block Highlighter");
 			} catch (IOException ignored) {
@@ -357,6 +389,17 @@ public class HighlighterClient implements ClientModInitializer {
 				out.add(box(hit.x(), hit.y(), hit.z(), hit.x() + 1, hit.y() + 1, hit.z() + 1, f.argb));
 			}
 
+			// Chunk Finder: a flat slab over each flagged chunk plus a thin pillar so it's visible from far away
+			if (Feature.CHUNK_FINDER.enabled) {
+				int c = Feature.CHUNK_FINDER.argb;
+				int strong = (Math.min(255, ((c >>> 24) & 0xFF) + 0x40) << 24) | (c & 0xFFFFFF);
+				for (ChunkFinder.Result r : ChunkFinder.flagged()) {
+					float x = r.cx() * 16f, z = r.cz() * 16f;
+					out.add(box(x, r.meanY(), z, x + 16f, r.meanY() + 0.4f, z + 16f, c));
+					out.add(box(x + 7.75f, r.minY(), z + 7.75f, x + 8.25f, r.maxY() + 1f, z + 8.25f, strong));
+				}
+			}
+
 			// Entities (computed every frame so they move smoothly)
 			List<Feature> entityFeatures = new ArrayList<>();
 			for (Feature f : Feature.values()) {
@@ -474,6 +517,142 @@ public class HighlighterClient implements ClientModInitializer {
 	 * The dropdown menu. Left click a row to toggle it. Right click a row (or click its swatch) to edit its color.
 	 * Press the open key again (or Esc) to close.
 	 */
+	/**
+	 * Chunk Finder: scores every loaded chunk by how many player-placed-looking blocks it contains and flags the ones
+	 * over the sensitivity threshold. Only chunks your game has loaded can be scanned. Scanning is spread over many ticks
+	 * so it never causes a lag spike.
+	 */
+	public static final class ChunkFinder {
+		public record Result(int cx, int cz, int score, float meanY, int minY, int maxY, long scannedTick) { }
+
+		private static final int SCANS_PER_TICK = 8;
+		private static final int CHECKS_PER_TICK = 64;
+		private static final long STALE_TICKS = 1200;
+
+		// Blocks that almost never generate naturally (strong signal) and ones that are common in player builds (weak signal).
+		private static final Set<String> STRONG = Set.of(
+				"hopper", "piston", "sticky_piston", "observer", "repeater", "comparator", "redstone_lamp", "dropper",
+				"enchanting_table", "beacon", "conduit", "ender_chest", "respawn_anchor", "glass", "tnt", "note_block", "jukebox",
+				"iron_block", "diamond_block", "emerald_block", "redstone_block", "lapis_block", "slime_block", "honey_block",
+				"target", "lightning_rod", "daylight_detector", "crafter");
+		private static final Set<String> WEAK = Set.of(
+				"torch", "wall_torch", "soul_torch", "soul_wall_torch", "crafting_table", "furnace", "blast_furnace", "smoker",
+				"chest", "trapped_chest", "barrel", "ladder");
+
+		private static final Map<Block, Integer> WEIGHTS = new IdentityHashMap<>();
+		private static final Map<Long, Result> results = new HashMap<>();
+		private static List<Result> flagged = List.of();
+		private static long ticks = 0;
+		private static int cursor = 0;
+
+		private ChunkFinder() { }
+
+		public static List<Result> flagged() {
+			return flagged;
+		}
+
+		private static long key(int cx, int cz) {
+			return ((long) cx & 0xFFFFFFFFL) | ((long) cz << 32);
+		}
+
+		private static int weight(BlockState state) {
+			Block block = state.getBlock();
+			Integer cached = WEIGHTS.get(block);
+			if (cached != null) return cached;
+			String path = BuiltInRegistries.BLOCK.getKey(block).getPath();
+			int w = 0;
+			if (STRONG.contains(path) || path.endsWith("_concrete") || path.endsWith("_concrete_powder")
+					|| path.endsWith("stained_glass") || path.endsWith("stained_glass_pane") || path.endsWith("_glazed_terracotta")) {
+				w = 3;
+			} else if (WEAK.contains(path) || path.endsWith("_bed")) {
+				w = 1;
+			}
+			WEIGHTS.put(block, w);
+			return w;
+		}
+
+		public static void tick(Minecraft mc) {
+			if (!Feature.CHUNK_FINDER.enabled || mc.level == null || mc.player == null) {
+				if (!results.isEmpty() || !flagged.isEmpty()) {
+					results.clear();
+					flagged = List.of();
+				}
+				return;
+			}
+			ticks++;
+
+			ClientLevel level = mc.level;
+			int dist = Config.finderDistance();
+			int pcx = mc.player.blockPosition().getX() >> 4;
+			int pcz = mc.player.blockPosition().getZ() >> 4;
+			int side = dist * 2 + 1;
+			int total = side * side;
+			int dist2 = dist * dist;
+
+			int scans = 0;
+			for (int n = 0; n < CHECKS_PER_TICK && scans < SCANS_PER_TICK; n++) {
+				cursor = (cursor + 1) % total;
+				int dx = cursor % side - dist;
+				int dz = cursor / side - dist;
+				if (dx * dx + dz * dz > dist2) continue;
+				int cx = pcx + dx, cz = pcz + dz;
+				if (!level.hasChunk(cx, cz)) continue;
+				Result old = results.get(key(cx, cz));
+				if (old != null && ticks - old.scannedTick() < STALE_TICKS) continue;
+				results.put(key(cx, cz), scanChunk(level, cx, cz));
+				scans++;
+			}
+
+			if (ticks % 100 == 0) {
+				results.values().removeIf(r -> {
+					int dx = r.cx() - pcx, dz = r.cz() - pcz;
+					return dx * dx + dz * dz > (dist + 1) * (dist + 1) || !level.hasChunk(r.cx(), r.cz());
+				});
+			}
+
+			if (ticks % 10 == 0) {
+				int threshold = Config.finderThreshold();
+				List<Result> out = new ArrayList<>();
+				for (Result r : results.values()) {
+					int dx = r.cx() - pcx, dz = r.cz() - pcz;
+					if (dx * dx + dz * dz <= dist2 && r.score() >= threshold) out.add(r);
+				}
+				flagged = out;
+			}
+		}
+
+		private static Result scanChunk(ClientLevel level, int cx, int cz) {
+			LevelChunk chunk = level.getChunk(cx, cz);
+			LevelChunkSection[] sections = chunk.getSections();
+			int minWorldY = level.getMinY();
+			int score = 0, count = 0;
+			long sumY = 0;
+			int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+
+			for (int i = 0; i < sections.length; i++) {
+				LevelChunkSection section = sections[i];
+				if (section.hasOnlyAir() || !section.maybeHas(s -> weight(s) > 0)) continue;
+				int baseY = minWorldY + i * 16;
+				for (int y = 0; y < 16; y++) {
+					for (int z = 0; z < 16; z++) {
+						for (int x = 0; x < 16; x++) {
+							int w = weight(section.getBlockState(x, y, z));
+							if (w <= 0) continue;
+							int wy = baseY + y;
+							score += w;
+							count++;
+							sumY += wy;
+							minY = Math.min(minY, wy);
+							maxY = Math.max(maxY, wy);
+						}
+					}
+				}
+			}
+			float meanY = count == 0 ? 0f : (float) sumY / count;
+			return new Result(cx, cz, score, meanY, count == 0 ? 0 : minY, count == 0 ? 0 : maxY, ticks);
+		}
+	}
+
 	/**
 	 * Hold-to-zoom. Works by temporarily overriding the FOV (and optionally sensitivity) options while the key is held,
 	 * then restoring your real values. No mixins needed.
@@ -640,6 +819,7 @@ public class HighlighterClient implements ClientModInitializer {
 			List<Row> highlights = new ArrayList<>();
 			List<Row> entities = new ArrayList<>();
 			for (Feature f : Feature.values()) {
+				if (f == Feature.CHUNK_FINDER) continue; // has its own section below
 				(f.isEntity() ? entities : highlights).add(Row.feature(f));
 			}
 			highlights.add(Row.cycle("Range", () -> Config.range + " blocks", dir -> {
@@ -658,10 +838,18 @@ public class HighlighterClient implements ClientModInitializer {
 			utilities.add(Row.toggle("Smooth zoom", () -> Config.zoomSmooth, () -> Config.zoomSmooth = !Config.zoomSmooth));
 			utilities.add(Row.toggle("Lower sensitivity", () -> Config.zoomLowerSens, () -> Config.zoomLowerSens = !Config.zoomLowerSens));
 
+			List<Row> finder = new ArrayList<>();
+			finder.add(Row.feature(Feature.CHUNK_FINDER));
+			finder.add(Row.cycle("Sensitivity", () -> Config.FINDER_SENS_NAMES[Config.finderSens],
+					dir -> Config.finderSens = Math.floorMod(Config.finderSens + dir, Config.FINDER_THRESHOLDS.length)));
+			finder.add(Row.cycle("Scan distance", () -> Config.finderDistance() + " chunks",
+					dir -> Config.finderDist = Math.floorMod(Config.finderDist + dir, Config.FINDER_DISTANCES.length)));
+
 			// Add more sections here later, e.g. new Section("Movement", List.of(...))
 			List<Section> out = new ArrayList<>();
 			out.add(new Section("Highlights", highlights));
 			out.add(new Section("Entities", entities));
+			out.add(new Section("Chunk Finder", finder));
 			out.add(new Section("Utilities", utilities));
 			return out;
 		}
